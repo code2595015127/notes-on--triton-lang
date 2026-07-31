@@ -1,4 +1,4 @@
-# 5127-21-INF-Computing-System_Software-ML_Toolchain-Language-Triton
+# notes-on--triton-lang
 
 https://deepwiki.com/triton-lang/triton
 https://stackblitz.com/~/github.com/triton-lang/triton
