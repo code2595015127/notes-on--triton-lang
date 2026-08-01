@@ -68,11 +68,14 @@ def vec_add_bench(device_triton):
 
     import os
     import re
+    import shutil
     device_id = torch.cuda.current_device()
     gpu_type = torch.cuda.get_device_name(device_id)
     safe_gpu_type = re.sub(r'[\\/:*?"<>| ]+', "_", gpu_type)
     save_path = os.path.abspath(f"__bench__gpu{device_id}_{safe_gpu_type}")
     print(f"save_path: {save_path}")
+    if os.path.isdir(save_path):
+        shutil.rmtree(save_path)
     os.makedirs(save_path, exist_ok=True)
     vec_add_bench.run(print_data=True, show_plots=True, save_path=save_path)
 
