@@ -1,11 +1,32 @@
 import triton
 import triton.language as tl
 import torch
-# torch.backends.cuda.matmul.allow_tf32 = True
+import re
+import os
+import shutil
+
+if os.path.isdir("~/.triton/cache"):
+    shutil.rmtree("~/.triton/cache")
+if os.path.isdir("~/.cache/triton"):
+    shutil.rmtree("~/.cache/triton")
+os.environ["TRITON_CACHE_DIR"] = "__triton_cache__"
+if os.path.isdir(os.environ["TRITON_CACHE_DIR"]):
+    shutil.rmtree(os.environ["TRITON_CACHE_DIR"])
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({'M_BLOCK': 128, 'N_BLOCK': 256, 'K_BLOCK': 64}, num_stages=1, num_warps=4),
+        triton.Config({'M_BLOCK': 128, 'N_BLOCK': 256, 'K_BLOCK': 64}, num_stages=4, num_warps=8), # import performance gain
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
-def matmul_kernel_naive(m_ptr, n_ptr, o_ptr, M, N, K, M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr, K_BLOCK: tl.constexpr):
+def matmul_kernel_naive(
+    m_ptr, n_ptr, o_ptr, 
+    M, N, K, 
+    M_BLOCK: tl.constexpr, N_BLOCK: tl.constexpr, K_BLOCK: tl.constexpr
+):
     # one program computes one [M_BLOCK, N_BLOCK] tile of o = m @ n
     row = tl.program_id(axis=0) * M_BLOCK
     col = tl.program_id(axis=1) * N_BLOCK
@@ -14,7 +35,7 @@ def matmul_kernel_naive(m_ptr, n_ptr, o_ptr, M, N, K, M_BLOCK: tl.constexpr, N_B
     n_col_off = col + tl.arange(0, N_BLOCK)[None, :]   # [1, N_BLOCK] cols of n / o
 
     acc = tl.zeros((M_BLOCK, N_BLOCK), dtype=tl.float32)
-    for k in tl.range(0, K, K_BLOCK): #, num_stages=3): # , num_warps=8):
+    for k in tl.range(0, K, K_BLOCK):
         m_col_off = k + tl.arange(0, K_BLOCK)[None, :]  # [1, K_BLOCK] cols of m
         n_row_off = k + tl.arange(0, K_BLOCK)[:, None]  # [K_BLOCK, 1] rows of n
 
@@ -32,7 +53,7 @@ def matmul_kernel_naive(m_ptr, n_ptr, o_ptr, M, N, K, M_BLOCK: tl.constexpr, N_B
     c = acc.to(tl.float16)
     o_off = m_row_off * N + n_col_off                   # [M_BLOCK, N_BLOCK]
     o_mas = (m_row_off < M) & (n_col_off < N)
-    tl.store(o_ptr + o_off, acc, mask=o_mas)
+    tl.store(o_ptr + o_off, c, mask=o_mas)
 
 
 @triton.autotune(
@@ -45,7 +66,6 @@ def matmul_kernel_naive(m_ptr, n_ptr, o_ptr, M, N, K, M_BLOCK: tl.constexpr, N_B
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
         triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=5, num_warps=2),
-        # Good config for fp8 inputs.
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
         triton.Config({'BLOCK_SIZE_M': 256, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 128, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
@@ -55,7 +75,7 @@ def matmul_kernel_naive(m_ptr, n_ptr, o_ptr, M, N, K, M_BLOCK: tl.constexpr, N_B
         triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
         triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4)
     ],
-    key=['M', 'N', 'K'],
+    key=['M', 'N', 'K', 'ENABLE_GROUP_ORDERING'],
 )
 @triton.jit
 def matmul_kernel_swizzle(
@@ -72,7 +92,7 @@ def matmul_kernel_swizzle(
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,  #
     GROUP_SIZE_M: tl.constexpr,  #
-    # ACTIVATION: tl.constexpr  #
+    ENABLE_GROUP_ORDERING: tl.constexpr,
 ):
     """Kernel for computing the matmul C = A x B.
     A has shape (M, K), B has shape (K, N) and C has shape (M, N)
@@ -84,12 +104,17 @@ def matmul_kernel_swizzle(
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    if ENABLE_GROUP_ORDERING:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+    else:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
 
     # -----------------------------------------------------------
     # Add some integer bound assumptions.
@@ -150,13 +175,8 @@ def matmul_op(m, n, kernel_type):
     assert K1 == K2, f"incompatible dims: {tuple(m.shape)} @ {tuple(n.shape)}"
     K = K1
     o = torch.empty((M, N), dtype=m.dtype, device=m.device)
-    if kernel_type == "naive":
-        M_BLOCK = 128
-        N_BLOCK = 256
-        K_BLOCK = 64
-        GRID = ((M + M_BLOCK - 1) // M_BLOCK, (N + N_BLOCK - 1) // N_BLOCK)
-        matmul_kernel_naive[GRID](m, n, o, M, N, K, M_BLOCK, N_BLOCK, K_BLOCK)
-    elif kernel_type == "swizzle":
+
+    if kernel_type == "triton1":
         grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
         matmul_kernel_swizzle[grid](
             m, n, o,  #
@@ -164,7 +184,23 @@ def matmul_op(m, n, kernel_type):
             m.stride(0), m.stride(1),  #
             n.stride(0), n.stride(1),  #
             o.stride(0), o.stride(1),  #
-            # ACTIVATION=""  #
+            ENABLE_GROUP_ORDERING = True
+        )
+    elif kernel_type == "triton2":
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+        matmul_kernel_swizzle[grid](
+            m, n, o,  #
+            M, N, K,  #
+            m.stride(0), m.stride(1),  #
+            n.stride(0), n.stride(1),  #
+            o.stride(0), o.stride(1),  #
+            ENABLE_GROUP_ORDERING = False
+        )
+    elif kernel_type == "triton3":
+        GRID = lambda META: ((M + META['M_BLOCK'] - 1) // META['M_BLOCK'], (N + META['N_BLOCK'] - 1) // META['N_BLOCK'])
+        matmul_kernel_naive[GRID](
+            m, n, o, 
+            M, N, K,
         )
     else:
         raise ValueError(f"Unknown kernel type: {kernel_type}")
@@ -180,7 +216,7 @@ def matmul_test():
     n = torch.randn(K, N, dtype=torch.float16, device='cuda:0')
     o_ref = torch.matmul(m, n)
     print(o_ref)
-    o = matmul_op(m, n, kernel_type="swizzle")
+    o = matmul_op(m, n, kernel_type="triton1")
     print(o)
     is_close = torch.allclose(o, o_ref, atol=1e-2, rtol=0)
     print(f"is_close: {is_close}")
@@ -196,9 +232,9 @@ def matmul_bench():
             line_arg="provider",  # Argument name whose value corresponds to a different line in the plot
             # Possible values for `line_arg`
             # Don't compare to cublas for fp8 cases as torch.matmul doesn't support fp8 at the moment.
-            line_vals=["torch", "triton1", "triton2"],  # Label name for the lines
-            line_names=["Torch", "Triton1", "Triton2"],  # Line styles
-            styles=[("green", "-"), ("blue", "-"), ("red", "-")],
+            line_vals=["torch", "triton1", "triton2", "triton3"],  # Label name for the lines
+            line_names=["Torch", "Triton1", "Triton2", "Triton3"],  # Line styles
+            styles=[("green", "-"), ("blue", "-"), ("black", "-"), ("red", "-")],
             ylabel="TFLOPS",  # Label name for the y-axis
             plot_name="matmul-performance-fp16",
             args={},
@@ -212,15 +248,14 @@ def matmul_bench():
         if provider == "torch":
             ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch.matmul(a, b), quantiles=quantiles)
         if provider == 'triton1':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_op(a, b, kernel_type="swizzle"), quantiles=quantiles)
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_op(a, b, kernel_type="triton1"), quantiles=quantiles)
         if provider == 'triton2':
-            ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_op(a, b, kernel_type="naive"), quantiles=quantiles)
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_op(a, b, kernel_type="triton2"), quantiles=quantiles)
+        if provider == 'triton3':
+            ms, min_ms, max_ms = triton.testing.do_bench(lambda: matmul_op(a, b, kernel_type="triton3"), quantiles=quantiles)
         perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
         return perf(ms), perf(max_ms), perf(min_ms)
 
-    import os
-    import re
-    import shutil
     device_id = torch.cuda.current_device()
     gpu_type = torch.cuda.get_device_name(device_id)
     safe_gpu_type = re.sub(r'[\\/:*?"<>| ]+', "_", gpu_type)
@@ -230,6 +265,7 @@ def matmul_bench():
         shutil.rmtree(save_path)
     os.makedirs(save_path, exist_ok=True)
     benchmark.run(print_data=True, show_plots=True, save_path=save_path)
+
 
 if __name__ == '__main__':
     matmul_test()
